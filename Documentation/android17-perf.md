@@ -12,6 +12,56 @@ The installer is configured from a clean upstream osm0sis/AnyKernel3 checkout.
 Do not supply DTB_BLOB; the build script no longer accepts a DTB override.
 Boot and radio operation still require physical-device validation.
 
+## Follow-up fixes (2026-10-28)
+
+- Complete ARM64 JIT support for 32/64-bit ADD, AND, OR and XOR atomics,
+  including FETCH, XCHG and CMPXCHG. The LL/SC lowering is backported from
+  Linux v6.1; the existing LSE fast path for non-fetching ADD is retained.
+  Fetch/exchange operations use store-release and the upstream DMB ISH
+  barrier sequence. These instructions no longer depend on interpreter
+  fallback, which is unavailable with BPF_JIT_ALWAYS_ON.
+- Include reference commit df6834a99abdaee4d148e7b48373f3f50fcb953f: expose
+  bpf_get_netns_cookie to CGROUP_SOCKOPT programs, including NULL context.
+- Keep CONFIG_DEBUG_INFO_BTF disabled, matching the A17 branch at
+  20352de7788298ec492483c1ee26bd03dc552959 for the perf/common/dipper
+  configuration. DEBUG_INFO alone does not enable BTF. This source tree
+  also lacks the resolve_btfids build tool; simply enabling BTF is not a
+  supported build configuration. Kernel-BTF-dependent features remain
+  outside the validated configuration.
+
+### Regression tests
+
+A standalone runner covers 44 atomic execution cases (both widths,
+positive/negative offsets, fetched values, memory updates, preserved
+registers, and CMPXCHG success/failure), plus two SOCKOPT helper load tests.
+It has no libbpf dependency:
+
+```sh
+cc -O2 -Wall -Wextra -Werror -Itools/include/uapi -Itools/include \
+  tools/testing/selftests/bpf/test_atomic_ops.c -o /tmp/test_atomic_ops
+sudo /tmp/test_atomic_ops
+```
+
+Build the runner with a suitable cross compiler to execute it on the phone.
+Run it on the newly built kernel; results from another kernel do not validate
+this kernel's verifier or JIT. Permission-denied SOCKOPT loads without a
+verifier log are reported as skipped, not passed.
+
+Validation for this follow-up:
+
+- The modified ARM64 instruction encoder, ARM64 JIT and cgroup BPF objects
+  compile with Clang/LLVM 14.0.6 and the dipper v3 configuration.
+- A full clean dipper build with that configuration successfully links
+  vmlinux and produces Image.gz-dtb with the three pinned external source
+  trees documented below. Those external trees are not committed here.
+- 130 sequences emitted by the actual LL/SC lowering and instruction
+  encoders execute successfully under both QEMU Cortex-A53 and max CPU
+  models. Cases include 32/64-bit operations, zero and signed offsets,
+  CMPXCHG success/failure, R0/source aliasing and 32-bit zero extension.
+- The standalone runner passes all 44 atomic cases on the build host's
+  kernel; the two SOCKOPT loads are skipped due to missing permissions.
+  This does not replace testing on the phone.
+
 ## Scope
 
 - BPF verifier, atomic instructions, BTF/module support, task-local storage,
