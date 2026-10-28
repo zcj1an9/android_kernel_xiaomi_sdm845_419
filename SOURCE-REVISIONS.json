@@ -1,0 +1,6 @@
+{
+  "kernel": "92fe7c4eb54c99c6e0a66f9b7dca50c348cf4265",
+  "techpack/mi845/": "87be21823dfeeca50735ae575f2c1b51f348cb70",
+  "arch/arm64/boot/dts/qcom-sdm845/": "be1279422f14437df8c185f952b4139ff7e10157",
+  "arch/arm64/boot/dts/xiaomi/": "c573577e1fb2e92f36f9546d2e45738e618316af"
+}

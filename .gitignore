@@ -146,6 +146,7 @@ Android.bp
 *.diff
 *.sh
 out/
+/out-a17-*/
 techpack/xiaomi-sdm845
 techpack/mi845
 arch/arm64/boot/dts/qcom-sdm845

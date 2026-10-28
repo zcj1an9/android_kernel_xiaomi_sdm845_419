@@ -1,0 +1,24 @@
+Dipper perf Android 17 v3 kernel source
+
+This branch includes the modified kernel. The three external source trees are
+excluded. Clone the pinned dependencies as documented in
+Documentation/android17-perf.md before building. Build outputs are omitted.
+No kernel, DTB, or installer binary from dipper-1.71.zip is used.
+
+Build with clang/LLVM/lld 14.0.6, flex, bison, bc, cpio, OpenSSL headers,
+libelf headers, and cross binutils for aarch64-linux-gnu and arm-linux-gnueabi.
+From the extracted source root:
+
+  CLANG_BIN=/path/to/llvm-14/bin JOBS=8 bash scripts/build-perf-a17.sh dipper
+
+Output: out-a17-dipper/arch/arm64/boot/Image.gz-dtb
+
+The script merges vendor/sdm845-perf_defconfig, vendor/xiaomi/sdm845-common.config,
+vendor/xiaomi/dipper.config, and vendor/xiaomi/dipper-a17-boot.config.
+dipper-v3-final.config is the resolved configuration used for the v3 test build.
+The test build release ended in a '+' due to its local git state; an exported
+source build may omit this suffix. The source and DTB revisions are recorded
+in SOURCE-REVISIONS.json.
+
+Compiled successfully; hardware boot and radio validation remain pending.
+KernelSU is not included.
