@@ -7,7 +7,7 @@
 #include <asm/setup.h>
 #endif
 
-#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+#if IS_ENABLED(CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG)
 #include <linux/jump_label.h>
 
 /* Declarations for the SUSFS cmdline hook applied by external builders. */
