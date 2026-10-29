@@ -7,6 +7,14 @@
 #include <asm/setup.h>
 #endif
 
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+#include <linux/jump_label.h>
+
+/* Declarations for the SUSFS cmdline hook applied by external builders. */
+extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
+extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+#endif
+
 #ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG
 #define INITRAMFS_STR_FIND "skip_initramf"
 #define INITRAMFS_STR_REPLACE "want_initramf"
