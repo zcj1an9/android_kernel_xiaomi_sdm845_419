@@ -8,6 +8,8 @@
 #include <linux/list_sort.h>
 #include <linux/jiffies.h>
 #include <linux/sched/stat.h>
+#include <linux/sched/signal.h>
+#include <linux/sysctl.h>
 #include <trace/events/sched.h>
 #include "sched.h"
 #include "walt.h"
@@ -1434,10 +1436,113 @@ static int account_busy_for_cpu_time(struct rq *rq, struct task_struct *p,
 
 #define DIV64_U64_ROUNDUP(X, Y) div64_u64((X) + (Y - 1), Y)
 
-static inline u64 scale_exec_time(u64 delta, struct rq *rq)
+static inline u64 scale_exec_time(u64 delta, struct rq *rq,
+				  struct task_struct *p)
 {
-	return (delta * rq->task_exec_scale) >> 10;
+	unsigned int boost = READ_ONCE(p->ravg.load_boost);
+
+	delta = (delta * rq->task_exec_scale) >> 10;
+	if (boost)
+		delta = div64_u64(delta * (100 + boost), 100);
+	return delta;
 }
+
+#ifdef CONFIG_SYSCTL
+static DEFINE_MUTEX(task_load_boost_lock);
+static int task_load_boost_last[2];
+
+/* The sysctl core passes a kernel buffer, not a userspace pointer. */
+static int task_load_boost_handler(struct ctl_table *table, int write,
+				   void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct task_struct *p;
+	struct rq_flags rf;
+	struct rq *rq;
+	char input[64], *cursor, *token;
+	int values[2], count = 0, ret = 0;
+
+	mutex_lock(&task_load_boost_lock);
+	if (!write) {
+		ret = proc_dointvec(table, write, buffer, lenp, ppos);
+		goto out;
+	}
+	if (!*lenp || *lenp >= sizeof(input)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	memcpy(input, buffer, *lenp);
+	input[*lenp] = '\0';
+	/* Reject embedded NULs, extra tokens and partial PID/boost pairs. */
+	if (strlen(input) != *lenp) {
+		ret = -EINVAL;
+		goto out;
+	}
+	cursor = strim(input);
+	while ((token = strsep(&cursor, " \t\n")) != NULL) {
+		if (!*token)
+			continue;
+		if (count == ARRAY_SIZE(values) ||
+		    kstrtoint(token, 10, &values[count++])) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	if (count != ARRAY_SIZE(values) || values[0] <= 0 ||
+	    values[1] < 0 || values[1] > 100) {
+		ret = -EINVAL;
+		goto out;
+	}
+	p = find_get_task_by_vpid(values[0]);
+	if (!p) {
+		/* Releasing a boost after the thread has exited is harmless. */
+		if (values[1]) {
+			ret = -ESRCH;
+			goto out;
+		}
+	} else {
+		rq = task_rq_lock(p, &rf);
+		if (exiting_task(p) || (p->flags & PF_EXITING)) {
+			ret = values[1] ? -ESRCH : 0;
+			task_rq_unlock(rq, p, &rf);
+			put_task_struct(p);
+			if (ret)
+				goto out;
+			goto released;
+		}
+		/* Account the elapsed interval with the previous boost value. */
+		update_task_ravg(p, rq, TASK_UPDATE, sched_ktime_clock(), 0);
+		WRITE_ONCE(p->ravg.load_boost, values[1]);
+		task_rq_unlock(rq, p, &rf);
+		put_task_struct(p);
+	}
+released:
+	task_load_boost_last[0] = values[0];
+	task_load_boost_last[1] = values[1];
+	*ppos += *lenp;
+out:
+	mutex_unlock(&task_load_boost_lock);
+	return ret;
+}
+
+static struct ctl_table task_load_boost_table[] = {
+	{
+		.procname = "task_load_boost",
+		.data = task_load_boost_last,
+		.maxlen = sizeof(task_load_boost_last),
+		.mode = 0644,
+		.proc_handler = task_load_boost_handler,
+	},
+	{ }
+};
+
+static int __init task_load_boost_sysctl_init(void)
+{
+	if (!register_sysctl("walt", task_load_boost_table))
+		return -ENOMEM;
+	return 0;
+}
+late_initcall(task_load_boost_sysctl_init);
+#endif
 
 /* Convert busy time to frequency equivalent
  * Assumes load is scaled to 1024
@@ -1557,7 +1662,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			delta = wallclock - mark_start;
 		else
 			delta = irqtime;
-		delta = scale_exec_time(delta, rq);
+		delta = scale_exec_time(delta, rq, p);
 		*curr_runnable_sum += delta;
 		if (new_task)
 			*nt_curr_runnable_sum += delta;
@@ -1589,7 +1694,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			 * A full window hasn't elapsed, account partial
 			 * contribution to previous completed window.
 			 */
-			delta = scale_exec_time(window_start - mark_start, rq);
+			delta = scale_exec_time(window_start - mark_start, rq, p);
 			if (!exiting_task(p)) {
 				p->ravg.prev_window += delta;
 				p->ravg.prev_window_cpu[cpu] += delta;
@@ -1600,7 +1705,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			 * the contribution to the previous window is the
 			 * full window (window_size).
 			 */
-			delta = scale_exec_time(window_size, rq);
+			delta = scale_exec_time(window_size, rq, p);
 			if (!exiting_task(p)) {
 				p->ravg.prev_window = delta;
 				p->ravg.prev_window_cpu[cpu] = delta;
@@ -1612,7 +1717,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			*nt_prev_runnable_sum += delta;
 
 		/* Account piece of busy time in the current window. */
-		delta = scale_exec_time(wallclock - window_start, rq);
+		delta = scale_exec_time(wallclock - window_start, rq, p);
 		*curr_runnable_sum += delta;
 		if (new_task)
 			*nt_curr_runnable_sum += delta;
@@ -1645,7 +1750,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			 * A full window hasn't elapsed, account partial
 			 * contribution to previous completed window.
 			 */
-			delta = scale_exec_time(window_start - mark_start, rq);
+			delta = scale_exec_time(window_start - mark_start, rq, p);
 			if (!is_idle_task(p) && !exiting_task(p)) {
 				p->ravg.prev_window += delta;
 				p->ravg.prev_window_cpu[cpu] += delta;
@@ -1656,7 +1761,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			 * the contribution to the previous window is the
 			 * full window (window_size).
 			 */
-			delta = scale_exec_time(window_size, rq);
+			delta = scale_exec_time(window_size, rq, p);
 			if (!is_idle_task(p) && !exiting_task(p)) {
 				p->ravg.prev_window = delta;
 				p->ravg.prev_window_cpu[cpu] = delta;
@@ -1672,7 +1777,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 			*nt_prev_runnable_sum += delta;
 
 		/* Account piece of busy time in the current window. */
-		delta = scale_exec_time(wallclock - window_start, rq);
+		delta = scale_exec_time(wallclock - window_start, rq, p);
 		*curr_runnable_sum += delta;
 		if (new_task)
 			*nt_curr_runnable_sum += delta;
@@ -1706,7 +1811,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 		 * window then that is all that need be accounted.
 		 */
 		if (mark_start > window_start) {
-			*curr_runnable_sum = scale_exec_time(irqtime, rq);
+			*curr_runnable_sum = scale_exec_time(irqtime, rq, p);
 			return;
 		}
 
@@ -1717,12 +1822,12 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 		delta = window_start - mark_start;
 		if (delta > window_size)
 			delta = window_size;
-		delta = scale_exec_time(delta, rq);
+		delta = scale_exec_time(delta, rq, p);
 		*prev_runnable_sum += delta;
 
 		/* Process the remaining IRQ busy time in the current window. */
 		delta = wallclock - window_start;
-		rq->curr_runnable_sum = scale_exec_time(delta, rq);
+		rq->curr_runnable_sum = scale_exec_time(delta, rq, p);
 
 		return;
 	}
@@ -1811,6 +1916,8 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	/* Ignore windows where task had no activity */
 	if (!runtime || is_idle_task(p) || exiting_task(p) || !samples)
 		goto done;
+	/* A boosted full-window sample must still fit in one WALT window. */
+	runtime = min(runtime, sched_ravg_window);
 
 	/* Push new 'runtime' value onto stack */
 	widx = sched_ravg_hist_size - 1;
@@ -1885,7 +1992,7 @@ done:
 
 static u64 add_to_task_demand(struct rq *rq, struct task_struct *p, u64 delta)
 {
-	delta = scale_exec_time(delta, rq);
+	delta = scale_exec_time(delta, rq, p);
 	p->ravg.sum += delta;
 	if (unlikely(p->ravg.sum > sched_ravg_window))
 		p->ravg.sum = sched_ravg_window;
@@ -1989,7 +2096,7 @@ static u64 update_task_demand(struct task_struct *p, struct rq *rq,
 	/* Push new sample(s) into task's demand history */
 	update_history(rq, p, p->ravg.sum, 1, event);
 	if (nr_full_windows) {
-		u64 scaled_window = scale_exec_time(window_size, rq);
+		u64 scaled_window = scale_exec_time(window_size, rq, p);
 
 		update_history(rq, p, scaled_window, nr_full_windows, event);
 		runtime += nr_full_windows * scaled_window;

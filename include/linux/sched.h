@@ -646,6 +646,8 @@ struct ravg {
 	u8 busy_buckets[NUM_BUSY_BUCKETS];
 	u16 demand_scaled;
 	u16 pred_demand_scaled;
+	/* Percentage added to this task's frequency-scaled WALT runtime. */
+	u16 load_boost;
 	u64 active_time;
 	u64 last_win_size;
 };
