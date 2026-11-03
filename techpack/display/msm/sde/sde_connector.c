@@ -13,6 +13,8 @@
 #include "sde_connector.h"
 #include "sde_encoder.h"
 #include <linux/backlight.h>
+#include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/string.h>
 #include "dsi_drm.h"
 #include "dsi_display.h"
@@ -24,6 +26,30 @@
 
 /* Autorefresh will occur after FRAME_CNT frames. Large values are unlikely */
 #define AUTOREFRESH_MAX_FRAME_CNT 6
+
+/* Temporary compatibility mode for dipper's legacy AOD display stack. */
+static bool dipper_aod_lp1 = true;
+module_param_named(dipper_aod_lp1, dipper_aod_lp1, bool, 0644);
+MODULE_PARM_DESC(dipper_aod_lp1,
+		 "Keep dipper DSI AOD in LP1 instead of LP2 (may increase AOD power)");
+
+static u64 sde_connector_aod_lp_mode(struct drm_connector *connector, u64 mode)
+{
+	const char *model;
+
+	if (!READ_ONCE(dipper_aod_lp1) ||
+	    connector->connector_type != DRM_MODE_CONNECTOR_DSI ||
+	    mode != SDE_MODE_DPMS_LP2)
+		return mode;
+
+	/* Dipper DTs identify the board in model, not in root compatible. */
+	if (of_property_read_string(of_root, "model", &model) ||
+	    !strstr(model, "Dipper"))
+		return mode;
+
+	pr_info_once("dipper AOD compatibility: keeping LP2 requests in LP1\n");
+	return SDE_MODE_DPMS_LP1;
+}
 
 #define SDE_DEBUG_CONN(c, fmt, ...) SDE_DEBUG("conn%d " fmt,\
 		(c) ? (c)->base.base.id : -1, ##__VA_ARGS__)
@@ -1386,6 +1412,15 @@ static int sde_connector_atomic_set_property(struct drm_connector *connector,
 	c_conn = to_sde_connector(connector);
 	c_state = to_sde_connector_state(state);
 
+	/*
+	 * Normalize before caching the property, including kernel-originated
+	 * commits. Panel commands, doze brightness and encoder power management
+	 * must all see LP1; changing only dsi_panel_set_lp2() is insufficient.
+	 */
+	idx = msm_property_index(&c_conn->property_info, property);
+	if (idx == CONNECTOR_PROP_LP)
+		val = sde_connector_aod_lp_mode(connector, val);
+
 	/* generic property handling */
 	rc = msm_property_atomic_set(&c_conn->property_info,
 			&c_state->property_state, property, val);
@@ -1393,7 +1428,6 @@ static int sde_connector_atomic_set_property(struct drm_connector *connector,
 		goto end;
 
 	/* connector-specific property handling */
-	idx = msm_property_index(&c_conn->property_info, property);
 	switch (idx) {
 	case CONNECTOR_PROP_LP:
 		if (connector->dev)
