@@ -1,15 +1,17 @@
 # Temporary hotspot startup diagnostics
 
 This test-only change traces execution of /system/bin/dnsmasq and execution or
-exit of direct netd child processes. Checking the parent's process leader also
-covers children spawned by netd binder threads before their executable changes.
+exit of processes whose executable basename is netd or dnsmasq. A vfork child
+inherits netd's executable before exec, even when Binder renamed the parent
+and child threads. The executable file is referenced while its name is checked.
 It leaves the A17 branch and all driver/configuration behavior unchanged.
 
 Messages are warning-level, rate-limited and prefixed with `tether_diag:`.
 They include only PID/TGID, execution result and encoded exit status; arguments,
-environment, SSIDs and passwords are never recorded. The netd-child selector
-also includes other direct netd helpers; correlate messages by PID rather than
-assuming that every traced child is dnsmasq.
+environment, SSIDs and passwords are never recorded. The executable selector
+also includes netd itself and pre-exec helpers; correlate messages by PID rather
+than assuming that every traced process is dnsmasq. Helpers that successfully
+exec a different image are no longer selected for exit logging.
 
 After building and flashing this test commit, boot Android, reproduce one
 hotspot failure and collect from the PC (root is not required):
@@ -40,3 +42,9 @@ is not included, and close_range support is not changed.
 
 Validation: patch style and review of filename lifetime and parent access.
 No complete kernel build or device validation was performed for this change.
+
+The first diagnostic revision used comm == netd on the parent's group leader.
+The supplied bugreport shows PID 1088's leader named binder:1088_3, which made
+that revision miss pre-exec child failures. This revision replaces comm matching
+with a referenced executable lookup and checks the basename under d_lock.
+The previous trace records alone did not establish dnsmasq's exec outcome.

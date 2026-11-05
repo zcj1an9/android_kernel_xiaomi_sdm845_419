@@ -2,26 +2,34 @@
 #ifndef _LINUX_TETHER_DIAG_H
 #define _LINUX_TETHER_DIAG_H
 
-#include <linux/rcupdate.h>
-#include <linux/sched/signal.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
 #include <linux/string.h>
 
-/* Temporary diagnostics: include children that fail before exec of dnsmasq. */
+/*
+ * A vfork child still has netd's executable before exec. Unlike task comm,
+ * this also identifies netd after its main thread is renamed by Binder.
+ */
 static inline bool tether_diag_current(void)
 {
-	struct task_struct *parent;
-	char comm[TASK_COMM_LEN];
+	struct file *exe;
+	struct dentry *dentry;
 	bool match;
 
-	get_task_comm(comm, current);
-	if (!strcmp(comm, "dnsmasq"))
-		return true;
+	exe = get_task_exe_file(current);
+	if (!exe)
+		return false;
 
-	rcu_read_lock();
-	parent = rcu_dereference(current->real_parent);
-	get_task_comm(comm, parent->group_leader);
-	match = !same_thread_group(current, parent) && !strcmp(comm, "netd");
-	rcu_read_unlock();
+	dentry = exe->f_path.dentry;
+	spin_lock(&dentry->d_lock);
+	match = (dentry->d_name.len == 4 &&
+		 !memcmp(dentry->d_name.name, "netd", 4)) ||
+		(dentry->d_name.len == 7 &&
+		 !memcmp(dentry->d_name.name, "dnsmasq", 7));
+	spin_unlock(&dentry->d_lock);
+	fput(exe);
 
 	return match;
 }
