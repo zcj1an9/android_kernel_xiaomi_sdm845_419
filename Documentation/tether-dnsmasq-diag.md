@@ -38,7 +38,8 @@ Interpretation:
 
 This is diagnostic instrumentation, not a hotspot fix. Remove it after identifying
 and verifying the underlying repair. The previously reverted nl80211 experiment
-is not included, and close_range support is not changed.
+is not included, and the subsequent close_range compatibility candidate is documented in
+close-range-backport.md.
 
 Validation: patch style and review of filename lifetime and parent access.
 No complete kernel build or device validation was performed for this change.
