@@ -19,7 +19,6 @@
 #include <linux/mount.h>
 #include <linux/fcntl.h>
 #include <linux/slab.h>
-#include <linux/tether_diag.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/personality.h>
@@ -1215,12 +1214,7 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
 SYSCALL_DEFINE3(close_range, unsigned int, fd, unsigned int, max_fd,
 		unsigned int, flags)
 {
-	int ret = __close_range(fd, max_fd, flags);
-
-	if (tether_diag_current())
-		pr_warn_ratelimited("tether_diag: close_range pid=%d first=%u last=%u flags=%#x ret=%d\n",
-				    task_pid_nr(current), fd, max_fd, flags, ret);
-	return ret;
+	return __close_range(fd, max_fd, flags);
 }
 
 /*

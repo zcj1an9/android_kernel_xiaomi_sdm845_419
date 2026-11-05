@@ -23,7 +23,6 @@
  */
 
 #include <linux/slab.h>
-#include <linux/tether_diag.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
 #include <linux/mm.h>
@@ -1901,21 +1900,7 @@ static int do_execveat_common(int fd, struct filename *filename,
 			      struct user_arg_ptr envp,
 			      int flags)
 {
-	bool trace = tether_diag_current() ||
-		(!IS_ERR_OR_NULL(filename) &&
-		 !strcmp(filename->name, "/system/bin/dnsmasq"));
-	int ret;
-
-	if (trace)
-		pr_warn_ratelimited("tether_diag: exec_enter pid=%d tgid=%d\n",
-				    task_pid_nr(current), task_tgid_nr(current));
-
-	/* filename is consumed by __do_execve_file: never inspect it below. */
-	ret = __do_execve_file(fd, filename, argv, envp, flags, NULL);
-	if (trace)
-		pr_warn_ratelimited("tether_diag: exec_result pid=%d ret=%d\n",
-				    task_pid_nr(current), ret);
-	return ret;
+	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
 }
 
 int do_execve_file(struct file *file, void *__argv, void *__envp)
