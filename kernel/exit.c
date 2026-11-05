@@ -6,6 +6,7 @@
 
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/tether_diag.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/stat.h>
@@ -878,6 +879,12 @@ void __noreturn do_exit(long code)
 		set_current_state(TASK_UNINTERRUPTIBLE);
 		schedule();
 	}
+
+	if (tether_diag_current())
+		pr_warn_ratelimited("tether_diag: exit pid=%d tgid=%d raw=%#lx status=%ld signal=%ld core=%d\n",
+				    task_pid_nr(tsk), task_tgid_nr(tsk), code,
+				    (code >> 8) & 0xff, code & 0x7f,
+				    !!(code & 0x80));
 
 	exit_signals(tsk);  /* sets PF_EXITING */
 	sched_exit(tsk);
