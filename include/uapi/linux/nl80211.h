@@ -2824,10 +2824,7 @@ enum nl80211_attrs {
 	NL80211_ATTR_HE_6GHZ_CAPABILITY =
 	NL80211_ATTR_WIPHY_EDMG_BW_CONFIG + 12,
 
-	/* Keep upstream UAPI numbering: 294..315 are reserved for features
-	 * not backported here (294 is NL80211_ATTR_FILS_DISCOVERY).
-	 */
-	NL80211_ATTR_MAX_NUM_AKM_SUITES = 316,
+	NL80211_ATTR_MAX_NUM_AKM_SUITES,
 
 	/* add attributes here, update the policy in nl80211.c */
 
