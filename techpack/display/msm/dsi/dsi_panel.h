@@ -272,6 +272,9 @@ struct dsi_panel {
 	s32 backlight_delta;
 	bool fod_hbm_enabled;
 	bool in_aod;
+	bool aod_mode_explicit;
+	bool aod_mode_pending;
+	u32 aod_mode_requested;
 	u32 doze_backlight_threshold;
 	u32 dc_threshold;
 	ktime_t fod_hbm_off_time;
@@ -378,6 +381,9 @@ int dsi_panel_unprepare(struct dsi_panel *panel);
 int dsi_panel_post_unprepare(struct dsi_panel *panel);
 
 int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl);
+
+struct dsi_display;
+int dsi_panel_request_aod_mode(struct dsi_display *display, u32 requested);
 
 int dsi_panel_enable_doze_backlight(struct dsi_panel *panel, u32 bl_lvl);
 

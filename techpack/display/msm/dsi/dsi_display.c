@@ -199,7 +199,7 @@ void dsi_rect_intersect(const struct dsi_rect *r1,
 
 /* Preserve the last nonzero AOD request for inspection after unlocking. */
 static DEFINE_SPINLOCK(dsi_aod_trace_lock);
-static char dsi_aod_trace[512] = "revision=1 no nonzero AOD backlight request recorded\n";
+static char dsi_aod_trace[512] = "revision=2 no nonzero AOD backlight request recorded\n";
 static u32 dsi_aod_trace_sequence;
 
 static int dsi_aod_trace_get(char *buffer, const struct kernel_param *kp)
@@ -230,15 +230,18 @@ static void dsi_display_trace_aod_backlight(struct dsi_panel *panel,
 	spin_lock_irqsave(&dsi_aod_trace_lock, flags);
 	dsi_aod_trace_sequence++;
 	scnprintf(dsi_aod_trace, sizeof(dsi_aod_trace),
-		"revision=1 sequence=%u panel=%s\n"
+		"revision=2 sequence=%u panel=%s\n"
 		"requested=%u scaled=%u scale=%u ui_max=%u bl_max=%u bl_min=%u\n"
 		"doze=%d power=%d in_aod=%d fod_hbm=%d fixed_path=%d\n"
+		"mode_explicit=%d pending=%d target_mode=%u threshold=%u\n"
 		"mode_rc=%d dbv_rc=%d clock_rc=%d result=%d\n",
 		dsi_aod_trace_sequence, panel->name ? panel->name : "unknown",
 		requested, scaled, bl->bl_scale, bl->brightness_max_level,
 		bl->bl_max_level, bl->bl_min_level, doze_state,
 		panel->power_mode, panel->in_aod, panel->fod_hbm_enabled,
 		bl->doze_brightness_varible_flag,
+		panel->aod_mode_explicit, panel->aod_mode_pending,
+		panel->aod_mode_requested, panel->doze_backlight_threshold,
 		mode_rc, dbv_rc, clock_rc, result);
 	spin_unlock_irqrestore(&dsi_aod_trace_lock, flags);
 }

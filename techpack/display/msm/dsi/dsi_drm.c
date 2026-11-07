@@ -371,6 +371,13 @@ int dsi_bridge_interface_enable(int timeout)
 }
 EXPORT_SYMBOL(dsi_bridge_interface_enable);
 
+static int dsi_bridge_set_doze_brightness(struct drm_bridge *bridge, u32 value)
+{
+	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+
+	return dsi_panel_request_aod_mode(c_bridge->display, value);
+}
+
 static void dsi_bridge_disp_param_set(struct drm_bridge *bridge, int cmd)
 {
 	int rc = 0;
@@ -789,6 +796,7 @@ static const struct drm_bridge_funcs dsi_bridge_ops = {
 	.disable      = dsi_bridge_disable,
 	.post_disable = dsi_bridge_post_disable,
 	.mode_set     = dsi_bridge_mode_set,
+	.set_doze_brightness = dsi_bridge_set_doze_brightness,
 	.disp_param_set = dsi_bridge_disp_param_set,
 	.disp_get_panel_info = dsi_bridge_get_panel_info,
 	.disp_param_get = dsi_bridge_disp_param_get,

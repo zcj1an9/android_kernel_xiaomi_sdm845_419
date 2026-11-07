@@ -6,6 +6,9 @@
  */
 
 #include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/moduleparam.h>
+#include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
@@ -596,11 +599,111 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 
 	return rc;
 }
+/* Small read-only history, retained across normal screen unlock. */
+#define DSI_AOD_HISTORY_SIZE 24
+
+struct dsi_aod_history_entry {
+	u64 time_ms;
+	const char *op;
+	u32 seq;
+	u32 value;
+	u32 count;
+	int rc;
+	int power;
+	bool in_aod;
+};
+
+static DEFINE_SPINLOCK(dsi_aod_history_lock);
+static struct dsi_aod_history_entry dsi_aod_history[DSI_AOD_HISTORY_SIZE];
+static u32 dsi_aod_history_head;
+static u32 dsi_aod_history_count;
+static u32 dsi_aod_history_seq;
+
+static void dsi_panel_record_aod(struct dsi_panel *panel, const char *op,
+		u32 value, u32 count, int rc)
+{
+	struct dsi_aod_history_entry *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dsi_aod_history_lock, flags);
+	entry = &dsi_aod_history[dsi_aod_history_head];
+	entry->time_ms = ktime_to_ms(ktime_get_boottime());
+	entry->op = op;
+	entry->seq = ++dsi_aod_history_seq;
+	entry->value = value;
+	entry->count = count;
+	entry->rc = rc;
+	entry->power = panel->power_mode;
+	entry->in_aod = panel->in_aod;
+	dsi_aod_history_head = (dsi_aod_history_head + 1) % DSI_AOD_HISTORY_SIZE;
+	if (dsi_aod_history_count < DSI_AOD_HISTORY_SIZE)
+		dsi_aod_history_count++;
+	spin_unlock_irqrestore(&dsi_aod_history_lock, flags);
+}
+
+static int dsi_aod_history_get(char *buffer, const struct kernel_param *kp)
+{
+	struct dsi_aod_history_entry *entry;
+	unsigned long flags;
+	u32 i, pos;
+	int len;
+
+	(void)kp;
+	spin_lock_irqsave(&dsi_aod_history_lock, flags);
+	len = scnprintf(buffer, PAGE_SIZE, "revision=1 entries=%u boottime_ms\n",
+		dsi_aod_history_count);
+	pos = (dsi_aod_history_head + DSI_AOD_HISTORY_SIZE -
+		dsi_aod_history_count) % DSI_AOD_HISTORY_SIZE;
+	for (i = 0; i < dsi_aod_history_count && len < PAGE_SIZE - 160; i++) {
+		entry = &dsi_aod_history[pos];
+		len += scnprintf(buffer + len, PAGE_SIZE - len,
+			"seq=%u ms=%llu op=%s value=0x%x count=%u rc=%d power=%d aod=%d\n",
+			entry->seq, entry->time_ms, entry->op, entry->value,
+			entry->count, entry->rc, entry->power, entry->in_aod);
+		pos = (pos + 1) % DSI_AOD_HISTORY_SIZE;
+	}
+	spin_unlock_irqrestore(&dsi_aod_history_lock, flags);
+	return len;
+}
+
+static const struct kernel_param_ops dsi_aod_history_ops = {
+	.get = dsi_aod_history_get,
+};
+module_param_cb(aod_panel_history, &dsi_aod_history_ops, NULL, 0444);
+MODULE_PARM_DESC(aod_panel_history, "Recent AOD panel commands and DBV writes");
+
+static const char *dsi_panel_aod_cmd_name(enum dsi_cmd_set_type type)
+{
+	switch (type) {
+	case DSI_CMD_SET_DOZE_HBM:
+		return "DOZE_HBM";
+	case DSI_CMD_SET_DOZE_LBM:
+		return "DOZE_LBM";
+	case DSI_CMD_SET_NOLP:
+		return "NOLP";
+	case DSI_CMD_SET_LP1:
+		return "LP1";
+	case DSI_CMD_SET_LP2:
+		return "LP2";
+	case DSI_CMD_SET_DISP_DIMMINGON:
+		return "DIMMING_ON";
+	case DSI_CMD_SET_DISP_DIMMINGOFF:
+		return "DIMMING_OFF";
+	case DSI_CMD_SET_DISP_HBM_ON:
+		return "HBM_ON";
+	case DSI_CMD_SET_DISP_HBM_OFF:
+		return "HBM_OFF";
+	default:
+		return NULL;
+	}
+}
+
 static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 				enum dsi_cmd_set_type type)
 {
 	int rc = 0, i = 0;
 	ssize_t len;
+	const char *trace_op;
 	struct dsi_cmd_desc *cmds;
 	u32 count;
 	enum dsi_cmd_set_state state;
@@ -644,6 +747,11 @@ static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 		cmds++;
 	}
 error:
+	trace_op = dsi_panel_aod_cmd_name(type);
+	if (trace_op && (panel->in_aod || type == DSI_CMD_SET_DOZE_HBM ||
+			type == DSI_CMD_SET_DOZE_LBM || type == DSI_CMD_SET_NOLP ||
+			type == DSI_CMD_SET_LP1 || type == DSI_CMD_SET_LP2))
+		dsi_panel_record_aod(panel, trace_op, type, count, rc);
 	return rc;
 }
 
@@ -774,6 +882,10 @@ static int dsi_panel_update_backlight(struct dsi_panel *panel,
 	if (rc < 0)
 		DSI_ERR("failed to update dcs backlight:%d\n", bl_lvl);
 
+	if (panel->in_aod || panel->power_mode == SDE_MODE_DPMS_LP1 ||
+			panel->power_mode == SDE_MODE_DPMS_LP2)
+		dsi_panel_record_aod(panel, "DBV", bl_lvl, 1, rc);
+
 	return rc;
 }
 
@@ -877,12 +989,131 @@ static int dsi_panel_seed_legacy_doze_locked(struct dsi_panel *panel,
 	return 0;
 }
 
+/* panel_lock is held. Keep a request pending until its commands succeed. */
+static int dsi_panel_apply_aod_mode_locked(struct dsi_panel *panel)
+{
+	struct dsi_display *display;
+	struct dsi_panel_cmd_set *set;
+	enum dsi_cmd_set_type type;
+	u32 requested = panel->aod_mode_requested;
+	int rc;
+
+	if (!panel->aod_mode_explicit)
+		return 0;
+	if (!panel->panel_initialized || panel->fod_hbm_enabled)
+		return 0;
+	if (!panel->host || !panel->cur_mode || !panel->cur_mode->priv_info)
+		return -EINVAL;
+
+	display = container_of(panel->host, struct dsi_display, host);
+	if (!display->drm_dev)
+		return -ENODEV;
+
+	if (requested == DOZE_BRIGHTNESS_INVALID) {
+		if (!panel->in_aod)
+			goto release;
+		type = DSI_CMD_SET_NOLP;
+	} else if (requested == DOZE_BRIGHTNESS_HBM) {
+		type = DSI_CMD_SET_DOZE_HBM;
+	} else if (requested == DOZE_BRIGHTNESS_LBM) {
+		type = DSI_CMD_SET_DOZE_LBM;
+	} else {
+		return -EINVAL;
+	}
+
+	set = &panel->cur_mode->priv_info->cmd_sets[type];
+	if (!set->count || !set->cmds)
+		return -EOPNOTSUPP;
+	rc = dsi_panel_tx_cmd_set(panel, type);
+	if (rc)
+		return rc;
+	if (requested != DOZE_BRIGHTNESS_INVALID) {
+		rc = dsi_panel_seed_legacy_doze_locked(panel, 1);
+		if (rc)
+			return rc;
+	}
+
+release:
+	display->drm_dev->doze_brightness = requested;
+	panel->in_aod = requested != DOZE_BRIGHTNESS_INVALID;
+	panel->aod_mode_pending = false;
+	if (panel->in_aod)
+		panel->skip_dimmingon = STATE_DIM_BLOCK;
+	else {
+		panel->aod_mode_explicit = false;
+		panel->skip_dimmingon = STATE_NONE;
+	}
+	return 0;
+}
+
+/*
+ * Compatibility ABI shared by doze_brightness and doze_backlight:
+ * 0 releases AOD mode, 1 selects HBM, and 2 selects LBM.
+ */
+int dsi_panel_request_aod_mode(struct dsi_display *display, u32 requested)
+{
+	struct dsi_panel *panel;
+	int rc = 0, clock_rc;
+	enum dsi_cmd_set_type type;
+	struct dsi_panel_cmd_set *set;
+
+	if (!display || !display->panel || !display->drm_dev ||
+		requested > DOZE_BRIGHTNESS_LBM)
+		return -EINVAL;
+	panel = display->panel;
+	mutex_lock(&display->display_lock);
+	mutex_lock(&panel->panel_lock);
+	if (requested && panel->cur_mode && panel->cur_mode->priv_info) {
+		type = requested == DOZE_BRIGHTNESS_HBM ?
+			DSI_CMD_SET_DOZE_HBM : DSI_CMD_SET_DOZE_LBM;
+		set = &panel->cur_mode->priv_info->cmd_sets[type];
+		if (!set->count || !set->cmds) {
+			rc = -EOPNOTSUPP;
+			goto unlock;
+		}
+	}
+	panel->aod_mode_requested = requested;
+	panel->aod_mode_explicit = true;
+	panel->aod_mode_pending = true;
+	dsi_panel_record_aod(panel, "mode_request", requested, 0, 0);
+
+	if (!requested && !panel->in_aod) {
+		panel->aod_mode_explicit = false;
+		panel->aod_mode_pending = false;
+		goto unlock;
+	}
+	if (!panel->panel_initialized || panel->fod_hbm_enabled ||
+		(panel->power_mode != SDE_MODE_DPMS_LP1 &&
+		 panel->power_mode != SDE_MODE_DPMS_LP2))
+		goto unlock;
+
+	rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_CORE_CLK, DSI_CLK_ON);
+	if (rc)
+		goto unlock;
+	rc = dsi_panel_apply_aod_mode_locked(panel);
+	clock_rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_CORE_CLK, DSI_CLK_OFF);
+	if (!rc)
+		rc = clock_rc;
+unlock:
+	dsi_panel_record_aod(panel, panel->aod_mode_pending ?
+		"mode_pending" : "mode_result", requested, 0, rc);
+	mutex_unlock(&panel->panel_lock);
+	mutex_unlock(&display->display_lock);
+	return rc;
+}
+
 /* panel_lock must be held by the LP1/LP2 transition. */
 static int dsi_panel_enter_legacy_doze_locked(struct dsi_panel *panel)
 {
 	struct dsi_panel_cmd_set *cmd_sets;
 	struct dsi_display *display;
 	int rc;
+
+	if (panel->aod_mode_explicit &&
+		(panel->aod_mode_pending || !panel->in_aod))
+		return dsi_panel_apply_aod_mode_locked(panel);
 
 	if (!panel->panel_initialized || panel->in_aod ||
 		panel->fod_hbm_enabled || !panel->cur_mode ||
@@ -940,6 +1171,13 @@ int dsi_panel_set_doze_backlight(struct dsi_display *display, u32 bl_lvl)
 		pr_info("%s FOD HBM open, skip value:%u\n", __func__, bl_lvl);
 		mutex_unlock(&panel->panel_lock);
 		return rc;
+	}
+
+	if (panel->aod_mode_explicit) {
+		if (panel->aod_mode_pending || !panel->in_aod ||
+			drm_dev->doze_brightness != panel->aod_mode_requested)
+			rc = dsi_panel_apply_aod_mode_locked(panel);
+		goto unlock;
 	}
 
 	if (bl_lvl > panel->doze_backlight_threshold) {
@@ -1062,27 +1300,7 @@ int dsi_panel_enable_doze_backlight(struct dsi_panel *panel, u32 bl_lvl)
 
 	mutex_lock(&panel->panel_lock);
 
-	/*
-	 * EA8074 needs DBV as well as the fixed AOD mode commands. The entry
-	 * seed is only a fallback until userspace submits its doze brightness.
-	 */
-	if (bl_lvl && panel->name &&
-		!strcmp(panel->name, "ss notch fhd cmd dsi panel") &&
-		bl->type == DSI_BACKLIGHT_DCS &&
-		bl->doze_brightness_varible_flag) {
-		if (panel->fod_hbm_enabled)
-			goto exit;
-
-		bl_temp = max_t(u32, bl->bl_min_level, 1);
-		if (bl_temp > bl->bl_max_level) {
-			rc = -EINVAL;
-			goto exit;
-		}
-		bl_temp = clamp_t(u32, bl_lvl, bl_temp, bl->bl_max_level);
-		rc = dsi_panel_update_backlight(panel, bl_temp);
-		DSI_DEBUG("[%s] AOD DBV request=%u applied=%u rc=%d\n",
-			panel->name, bl_lvl, bl_temp, rc);
-	} else if (bl->doze_brightness_varible_flag) {
+	if (bl->doze_brightness_varible_flag) {
 		rc = dsi_panel_seed_legacy_doze_locked(panel, bl_lvl);
 		if (rc)
 			goto exit;
@@ -5087,6 +5305,7 @@ exit:
 int dsi_panel_set_nolp(struct dsi_panel *panel)
 {
 	int rc = 0;
+	struct dsi_display *display;
 
 	if (!panel) {
 		DSI_ERR("invalid params\n");
@@ -5112,7 +5331,18 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 		       panel->name, rc);
 exit:
 	panel->fod_hbm_enabled = false;
-	panel->in_aod = false;
+	if (!rc) {
+		panel->in_aod = false;
+		panel->aod_mode_explicit = false;
+		panel->aod_mode_pending = false;
+		panel->aod_mode_requested = DOZE_BRIGHTNESS_INVALID;
+		panel->skip_dimmingon = STATE_NONE;
+		if (panel->host) {
+			display = container_of(panel->host, struct dsi_display, host);
+			if (display->drm_dev)
+				display->drm_dev->doze_brightness = DOZE_BRIGHTNESS_INVALID;
+		}
+	}
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
@@ -5449,6 +5679,8 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 	}
 
 	DSI_DEBUG("[LCD] param_type=%d\n", param);
+	if (panel->in_aod)
+		dsi_panel_record_aod(panel, "disp_param", param, 0, 0);
 
 	if (param & 0x1000000) {
 		panel->hist_bl_offset = (param & 0x0FF);
@@ -5673,20 +5905,19 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_SRGB);
 		break;
 	case 0x600000:
-		if (panel->in_aod) {
-			pr_info("doze hbm On\n");
-			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DOZE_HBM);
-		}
-		break;
 	case 0x700000:
-		if (panel->in_aod) {
-			pr_info("doze lbm On\n");
-			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DOZE_LBM);
-		}
-		break;
 	case 0x800000:
-		pr_info("doze Off\n");
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_NOLP);
+		panel->aod_mode_requested = temp == 0x600000 ?
+			DOZE_BRIGHTNESS_HBM : temp == 0x700000 ?
+			DOZE_BRIGHTNESS_LBM : DOZE_BRIGHTNESS_INVALID;
+		panel->aod_mode_explicit = true;
+		panel->aod_mode_pending = true;
+		if (panel->in_aod)
+			rc = dsi_panel_apply_aod_mode_locked(panel);
+		else if (!panel->aod_mode_requested) {
+			panel->aod_mode_explicit = false;
+			panel->aod_mode_pending = false;
+		}
 		break;
 	case 0xA00000:
 		{
@@ -5781,6 +6012,12 @@ static int panel_disp_param_send_lock(struct dsi_panel *panel, int param)
 	default:
 		break;
 	}
+
+	if (!rc && panel->aod_mode_explicit && panel->aod_mode_pending &&
+		!panel->fod_hbm_enabled &&
+		(panel->power_mode == SDE_MODE_DPMS_LP1 ||
+		 panel->power_mode == SDE_MODE_DPMS_LP2))
+		rc = dsi_panel_apply_aod_mode_locked(panel);
 
 	mutex_unlock(&panel->panel_lock);
 	return rc;

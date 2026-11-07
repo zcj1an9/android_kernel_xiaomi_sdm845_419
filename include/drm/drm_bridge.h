@@ -239,6 +239,9 @@ struct drm_bridge_funcs {
 	 */
 	void (*enable)(struct drm_bridge *bridge);
 
+	/* Optional AOD mode ABI: 0 normal, 1 HBM, 2 LBM. */
+	int (*set_doze_brightness)(struct drm_bridge *bridge, u32 value);
+
 	void (*disp_param_set)(struct drm_bridge *bridge, int cmd);
 	int (*disp_get_panel_info)(struct drm_bridge *bridge, char *name);
 	ssize_t (*disp_param_get)(struct drm_bridge *bridge, char *buf);
