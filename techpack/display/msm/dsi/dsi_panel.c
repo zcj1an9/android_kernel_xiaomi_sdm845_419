@@ -842,6 +842,41 @@ static void dsi_panel_offon_mode_control(struct dsi_panel *panel, u32 bl_lvl)
 	return;
 }
 
+/*
+ * EA8074's fixed-luminance AOD commands only program 0x53, not DBV (0x51).
+ * Restore a minimal nonzero DBV after screen-off, without making subsequent
+ * AOD brightness requests overwrite the panel's fixed HBM/LBM luminance.
+ * panel_lock must be held.
+ */
+static int dsi_panel_seed_legacy_doze_locked(struct dsi_panel *panel,
+		u32 bl_lvl)
+{
+	struct dsi_backlight_config *bl = &panel->bl_config;
+	u32 seed;
+	int rc;
+
+	if (!bl_lvl || panel->last_bl_lvl || panel->fod_hbm_enabled ||
+		!panel->panel_initialized || !panel->name ||
+		strcmp(panel->name, "ss notch fhd cmd dsi panel") ||
+		bl->type != DSI_BACKLIGHT_DCS ||
+		!bl->doze_brightness_varible_flag)
+		return 0;
+
+	seed = max_t(u32, bl->bl_min_level, 1);
+	if (seed > bl->bl_max_level)
+		return -EINVAL;
+
+	rc = dsi_panel_update_backlight(panel, seed);
+	if (rc < 0) {
+		DSI_ERR("[%s] AOD DBV seed failed, rc=%d\n", panel->name, rc);
+		return rc;
+	}
+
+	panel->last_bl_lvl = seed;
+	DSI_INFO("[%s] AOD DBV seeded at %u\n", panel->name, seed);
+	return 0;
+}
+
 /* panel_lock must be held by the LP1/LP2 transition. */
 static int dsi_panel_enter_legacy_doze_locked(struct dsi_panel *panel)
 {
@@ -875,9 +910,13 @@ static int dsi_panel_enter_legacy_doze_locked(struct dsi_panel *panel)
 		return rc;
 	}
 
+	rc = dsi_panel_seed_legacy_doze_locked(panel, 1);
+	if (rc)
+		return rc;
+
 	display->drm_dev->doze_brightness = DOZE_BRIGHTNESS_LBM;
 	panel->in_aod = true;
-	DSI_INFO("[%s] AOD entry LBM applied without backlight update\n",
+	DSI_INFO("[%s] AOD entry LBM applied (DBV seed v2)\n",
 		panel->name);
 	return 0;
 }
@@ -1024,6 +1063,9 @@ int dsi_panel_enable_doze_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	mutex_lock(&panel->panel_lock);
 
 	if (bl->doze_brightness_varible_flag) {
+		rc = dsi_panel_seed_legacy_doze_locked(panel, bl_lvl);
+		if (rc)
+			goto exit;
 		if (bl_lvl == 0 && panel->bl_config.bl_remap_flag
 				&& panel->bl_config.brightness_max_level && panel->bl_config.bl_max_level) {
 			bl_temp = (panel->bl_config.bl_max_level - panel->bl_config.bl_min_level) * bl_lvl / panel->bl_config.brightness_max_level
@@ -1034,10 +1076,14 @@ int dsi_panel_enable_doze_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		rc = dsi_panel_update_backlight(panel, bl_lvl);
 	}
 
+	if (rc < 0)
+		goto exit;
+
 	panel->last_bl_lvl = bl_lvl;
 	if (!bl_lvl && panel->hist_bl_offset)
 		panel->hist_bl_offset = 0;
 
+exit:
 	mutex_unlock(&panel->panel_lock);
 
 	return rc;
