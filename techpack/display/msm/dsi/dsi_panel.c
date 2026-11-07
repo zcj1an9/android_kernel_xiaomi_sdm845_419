@@ -1062,7 +1062,27 @@ int dsi_panel_enable_doze_backlight(struct dsi_panel *panel, u32 bl_lvl)
 
 	mutex_lock(&panel->panel_lock);
 
-	if (bl->doze_brightness_varible_flag) {
+	/*
+	 * EA8074 needs DBV as well as the fixed AOD mode commands. The entry
+	 * seed is only a fallback until userspace submits its doze brightness.
+	 */
+	if (bl_lvl && panel->name &&
+		!strcmp(panel->name, "ss notch fhd cmd dsi panel") &&
+		bl->type == DSI_BACKLIGHT_DCS &&
+		bl->doze_brightness_varible_flag) {
+		if (panel->fod_hbm_enabled)
+			goto exit;
+
+		bl_temp = max_t(u32, bl->bl_min_level, 1);
+		if (bl_temp > bl->bl_max_level) {
+			rc = -EINVAL;
+			goto exit;
+		}
+		bl_temp = clamp_t(u32, bl_lvl, bl_temp, bl->bl_max_level);
+		rc = dsi_panel_update_backlight(panel, bl_temp);
+		DSI_DEBUG("[%s] AOD DBV request=%u applied=%u rc=%d\n",
+			panel->name, bl_lvl, bl_temp, rc);
+	} else if (bl->doze_brightness_varible_flag) {
 		rc = dsi_panel_seed_legacy_doze_locked(panel, bl_lvl);
 		if (rc)
 			goto exit;
