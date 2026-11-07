@@ -4,6 +4,8 @@
  */
 
 #include <linux/list.h>
+#include <linux/moduleparam.h>
+#include <linux/spinlock.h>
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/err.h>
@@ -195,6 +197,52 @@ void dsi_rect_intersect(const struct dsi_rect *r1,
 	}
 }
 
+/* Preserve the last nonzero AOD request for inspection after unlocking. */
+static DEFINE_SPINLOCK(dsi_aod_trace_lock);
+static char dsi_aod_trace[512] = "revision=1 no nonzero AOD backlight request recorded\n";
+static u32 dsi_aod_trace_sequence;
+
+static int dsi_aod_trace_get(char *buffer, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int len;
+
+	(void)kp;
+	spin_lock_irqsave(&dsi_aod_trace_lock, flags);
+	len = scnprintf(buffer, PAGE_SIZE, "%s", dsi_aod_trace);
+	spin_unlock_irqrestore(&dsi_aod_trace_lock, flags);
+	return len;
+}
+
+static const struct kernel_param_ops dsi_aod_trace_ops = {
+	.get = dsi_aod_trace_get,
+};
+module_param_cb(aod_backlight_status, &dsi_aod_trace_ops, NULL, 0444);
+MODULE_PARM_DESC(aod_backlight_status, "Last nonzero AOD backlight request and result");
+
+static void dsi_display_trace_aod_backlight(struct dsi_panel *panel,
+		u32 requested, u32 scaled, int doze_state,
+		int mode_rc, int dbv_rc, int clock_rc, int result)
+{
+	struct dsi_backlight_config *bl = &panel->bl_config;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dsi_aod_trace_lock, flags);
+	dsi_aod_trace_sequence++;
+	scnprintf(dsi_aod_trace, sizeof(dsi_aod_trace),
+		"revision=1 sequence=%u panel=%s\n"
+		"requested=%u scaled=%u scale=%u ui_max=%u bl_max=%u bl_min=%u\n"
+		"doze=%d power=%d in_aod=%d fod_hbm=%d fixed_path=%d\n"
+		"mode_rc=%d dbv_rc=%d clock_rc=%d result=%d\n",
+		dsi_aod_trace_sequence, panel->name ? panel->name : "unknown",
+		requested, scaled, bl->bl_scale, bl->brightness_max_level,
+		bl->bl_max_level, bl->bl_min_level, doze_state,
+		panel->power_mode, panel->in_aod, panel->fod_hbm_enabled,
+		bl->doze_brightness_varible_flag,
+		mode_rc, dbv_rc, clock_rc, result);
+	spin_unlock_irqrestore(&dsi_aod_trace_lock, flags);
+}
+
 int dsi_display_set_backlight(struct drm_connector *connector,
 		void *display, u32 bl_lvl)
 {
@@ -203,13 +251,18 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 	struct drm_device *drm_dev;
 	u32 bl_scale, bl_scale_sv;
 	u64 bl_temp;
-	int rc = 0;
+	int rc = 0, clock_rc = -ENODATA;
+	int mode_rc = -ENODATA, dbv_rc = -ENODATA;
+	int doze_state;
 
 	if (dsi_display == NULL || dsi_display->panel == NULL)
 		return -EINVAL;
 
 	panel = dsi_display->panel;
 	drm_dev = dsi_display->drm_dev;
+	if (!drm_dev)
+		return -EINVAL;
+	doze_state = READ_ONCE(drm_dev->doze_state);
 
 	if (!dsi_panel_initialized(panel)) {
 		pr_info("[%s] set backlight before panel initialized, caching value: %d\n",
@@ -221,7 +274,7 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 
 	/* scale backlight */
 	bl_scale = panel->bl_config.bl_scale;
-	bl_temp = bl_lvl * bl_scale / MAX_BL_SCALE_LEVEL;
+	bl_temp = (u64)bl_lvl * bl_scale / MAX_BL_SCALE_LEVEL;
 
 	bl_scale_sv = panel->bl_config.bl_scale_sv;
 	/* xiaomi change */
@@ -237,15 +290,20 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 		goto error;
 	}
 
-	if (drm_dev && drm_dev->doze_state == DRM_BLANK_LP1) {
-		rc = dsi_panel_set_doze_backlight(display, (u32)bl_temp);
+	if (doze_state == DRM_BLANK_LP1) {
+		mode_rc = dsi_panel_set_doze_backlight(display, (u32)bl_temp);
+		rc = mode_rc;
+		if (rc) {
+			DSI_ERR("unable to set doze backlight, rc=%d\n", rc);
+			goto clocks_off;
+		}
+		dbv_rc = dsi_panel_enable_doze_backlight(panel, (u32)bl_temp);
+		rc = dbv_rc;
 		if (rc)
-			DSI_ERR("unable to set doze backlight\n");
-		rc = dsi_panel_enable_doze_backlight(panel, (u32)bl_temp);
-		if (rc)
-			DSI_ERR("unable to enable doze backlight\n");
-	} else if (drm_dev && drm_dev->doze_state == DRM_BLANK_LP2) {
+			DSI_ERR("unable to enable doze backlight, rc=%d\n", rc);
+	} else if (doze_state == DRM_BLANK_LP2) {
 		DSI_ERR("unable to set doze backlight in LP2 state:%u\n", (u32)bl_temp);
+		rc = -EAGAIN;
 	} else {
 		drm_dev->doze_brightness = DOZE_BRIGHTNESS_INVALID;
 		rc = dsi_panel_set_backlight(panel, (u32)bl_temp);
@@ -253,15 +311,21 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 			DSI_ERR("unable to set backlight\n");
 	}
 
-	rc = dsi_display_clk_ctrl(dsi_display->dsi_clk_handle,
+clocks_off:
+	clock_rc = dsi_display_clk_ctrl(dsi_display->dsi_clk_handle,
 			DSI_CORE_CLK, DSI_CLK_OFF);
-	if (rc) {
+	if (clock_rc) {
 		DSI_ERR("[%s] failed to disable DSI core clocks, rc=%d\n",
-		       dsi_display->name, rc);
-		goto error;
+		       dsi_display->name, clock_rc);
+		if (!rc)
+			rc = clock_rc;
 	}
 
 error:
+	if (bl_lvl && (doze_state == DRM_BLANK_LP1 ||
+			doze_state == DRM_BLANK_LP2))
+		dsi_display_trace_aod_backlight(panel, bl_lvl, (u32)bl_temp,
+			doze_state, mode_rc, dbv_rc, clock_rc, rc);
 	return rc;
 }
 
