@@ -842,6 +842,46 @@ static void dsi_panel_offon_mode_control(struct dsi_panel *panel, u32 bl_lvl)
 	return;
 }
 
+/* panel_lock must be held by the LP1/LP2 transition. */
+static int dsi_panel_enter_legacy_doze_locked(struct dsi_panel *panel)
+{
+	struct dsi_panel_cmd_set *cmd_sets;
+	struct dsi_display *display;
+	int rc;
+
+	if (!panel->panel_initialized || panel->in_aod ||
+		panel->fod_hbm_enabled || !panel->cur_mode ||
+		!panel->cur_mode->priv_info || !panel->host)
+		return 0;
+
+	cmd_sets = panel->cur_mode->priv_info->cmd_sets;
+	/* Keep panels with native LP command sequences on their existing path. */
+	if (cmd_sets[DSI_CMD_SET_LP1].count ||
+		cmd_sets[DSI_CMD_SET_LP2].count ||
+		!cmd_sets[DSI_CMD_SET_DOZE_LBM].count ||
+		!cmd_sets[DSI_CMD_SET_DOZE_LBM].cmds ||
+		!cmd_sets[DSI_CMD_SET_NOLP].count ||
+		!cmd_sets[DSI_CMD_SET_NOLP].cmds)
+		return 0;
+
+	display = container_of(panel->host, struct dsi_display, host);
+	if (!display->drm_dev)
+		return -ENODEV;
+
+	/* Do not wait for an unchanged brightness to be submitted by userspace. */
+	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DOZE_LBM);
+	if (rc) {
+		DSI_ERR("[%s] AOD entry LBM failed, rc=%d\n", panel->name, rc);
+		return rc;
+	}
+
+	display->drm_dev->doze_brightness = DOZE_BRIGHTNESS_LBM;
+	panel->in_aod = true;
+	DSI_INFO("[%s] AOD entry LBM applied without backlight update\n",
+		panel->name);
+	return 0;
+}
+
 int dsi_panel_set_doze_backlight(struct dsi_display *display, u32 bl_lvl)
 {
 	int rc = 0;
@@ -864,21 +904,27 @@ int dsi_panel_set_doze_backlight(struct dsi_display *display, u32 bl_lvl)
 	}
 
 	if (bl_lvl > panel->doze_backlight_threshold) {
-		if (drm_dev->doze_brightness != DOZE_BRIGHTNESS_HBM) {
+		if (!panel->in_aod ||
+			drm_dev->doze_brightness != DOZE_BRIGHTNESS_HBM) {
 			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DOZE_HBM);
-			if (rc)
-				pr_err("[%s] failed to send DSI_CMD_SET_DOZE_LBM cmd, rc=%d\n",
-					   panel->name, rc);
+			if (rc) {
+				DSI_ERR("[%s] AOD HBM command failed, rc=%d\n",
+					panel->name, rc);
+				goto unlock;
+			}
 			drm_dev->doze_brightness = DOZE_BRIGHTNESS_HBM;
 		}
 		panel->in_aod = true;
 
 	} else if (bl_lvl <= panel->doze_backlight_threshold && bl_lvl > 0) {
-		if (drm_dev->doze_brightness != DOZE_BRIGHTNESS_LBM) {
+		if (!panel->in_aod ||
+			drm_dev->doze_brightness != DOZE_BRIGHTNESS_LBM) {
 			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DOZE_LBM);
-			if (rc)
-				pr_err("[%s] failed to send DSI_CMD_SET_DOZE_HBM cmd, rc=%d\n",
-				       panel->name, rc);
+			if (rc) {
+				DSI_ERR("[%s] AOD LBM command failed, rc=%d\n",
+					panel->name, rc);
+				goto unlock;
+			}
 			drm_dev->doze_brightness = DOZE_BRIGHTNESS_LBM;
 		}
 		panel->in_aod = true;
@@ -886,6 +932,7 @@ int dsi_panel_set_doze_backlight(struct dsi_display *display, u32 bl_lvl)
 		drm_dev->doze_brightness = DOZE_BRIGHTNESS_INVALID;
 	}
 
+unlock:
 	mutex_unlock(&panel->panel_lock);
 
 	pr_info("%s value:%u\n", __func__, drm_dev->doze_brightness);
@@ -4939,6 +4986,8 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
+	if (!rc)
+		rc = dsi_panel_enter_legacy_doze_locked(panel);
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4962,6 +5011,8 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
+	if (!rc)
+		rc = dsi_panel_enter_legacy_doze_locked(panel);
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
