@@ -30,7 +30,7 @@
 #define COOKIE_SIZE (BYTE_SIZE*COOKIE_NUM_BYTE)
 #define COOKIE_MASK ((1<<COOKIE_SIZE)-1)
 #define HANDLE_INIT (-1)
-#define CAM_SMMU_CB_MAX 2
+#define CAM_SMMU_CB_MAX 5
 
 #define GET_SMMU_HDL(x, y) (((x) << COOKIE_SIZE) | ((y) & COOKIE_MASK))
 #define GET_SMMU_TABLE_IDX(x) (((x) >> COOKIE_SIZE) & COOKIE_MASK)
@@ -389,7 +389,7 @@ static uint32_t cam_smmu_find_closest_mapping(int idx, void *vaddr)
 	unsigned long start_addr, end_addr, current_addr;
 	uint32_t buf_handle = 0;
 
-	long delta = 0, lowest_delta = 0;
+	unsigned long delta, lowest_delta = ULONG_MAX;
 
 	current_addr = (unsigned long)vaddr;
 	list_for_each_entry(mapping,
@@ -397,7 +397,7 @@ static uint32_t cam_smmu_find_closest_mapping(int idx, void *vaddr)
 		start_addr = (unsigned long)mapping->paddr;
 		end_addr = (unsigned long)mapping->paddr + mapping->len;
 
-		if (start_addr <= current_addr && current_addr <= end_addr) {
+		if (start_addr <= current_addr && current_addr < end_addr) {
 			closest_mapping = mapping;
 			CAM_INFO(CAM_SMMU,
 				"Found va 0x%lx in:0x%lx-0x%lx, fd %d cb:%s",
@@ -409,9 +409,9 @@ static uint32_t cam_smmu_find_closest_mapping(int idx, void *vaddr)
 			if (start_addr > current_addr)
 				delta =  start_addr - current_addr;
 			else
-				delta = current_addr - end_addr - 1;
+				delta = current_addr - end_addr;
 
-			if (delta < lowest_delta || lowest_delta == 0) {
+			if (!closest_mapping || delta < lowest_delta) {
 				lowest_delta = delta;
 				closest_mapping = mapping;
 			}
@@ -426,11 +426,11 @@ end:
 	if (closest_mapping) {
 		buf_handle = GET_MEM_HANDLE(idx, closest_mapping->ion_fd);
 		CAM_INFO(CAM_SMMU,
-			"Closest map fd %d 0x%lx %llu-%llu 0x%lx-0x%lx buf=%pK mem %0x",
+			"Closest map fd %d fault=0x%lx len=%zu 0x%lx-0x%lx buf=%pK mem %0x",
 			closest_mapping->ion_fd, current_addr,
-			mapping->len, closest_mapping->len,
+			closest_mapping->len,
 			(unsigned long)closest_mapping->paddr,
-			(unsigned long)closest_mapping->paddr + mapping->len,
+			(unsigned long)closest_mapping->paddr + closest_mapping->len,
 			closest_mapping->buf,
 			buf_handle);
 	} else
@@ -1646,7 +1646,9 @@ static int cam_smmu_map_buffer_validate(struct dma_buf *buf,
 		}
 		iommu_cb_set.cb_info[idx].shared_mapping_size += *len_ptr;
 	} else if (region_id == CAM_SMMU_REGION_IO) {
-		if (!dis_delayed_unmap)
+		/* Match A17's delayed IO mappings for the shared ICP pipeline. */
+		if (!dis_delayed_unmap ||
+			!strcmp(iommu_cb_set.cb_info[idx].name, "icp"))
 			attach->dma_map_attrs |= DMA_ATTR_DELAYED_UNMAP;
 
 		table = dma_buf_map_attachment(attach, dma_dir);
@@ -3101,6 +3103,7 @@ static int cam_smmu_setup_cb(struct cam_context_bank_info *cb,
 	struct device *dev)
 {
 	int rc = 0;
+	int non_fatal = 1;
 
 	if (!cb || !dev) {
 		CAM_ERR(CAM_SMMU, "Error: invalid input params");
@@ -3153,10 +3156,25 @@ static int cam_smmu_setup_cb(struct cam_context_bank_info *cb,
 	/* create a virtual mapping */
 	if (cb->io_support) {
 		cb->domain = iommu_get_domain_for_dev(dev);
-		if (IS_ERR(cb->domain)) {
+		if (IS_ERR_OR_NULL(cb->domain)) {
 			CAM_ERR(CAM_SMMU, "Error: create domain Failed");
 			rc = -ENODEV;
 			goto end;
+		}
+
+		/*
+		 * Terminate faulty ICP DMA transactions without taking down the
+		 * whole device. Keep fault callbacks and SMMU diagnostics enabled;
+		 * this does not repair a missing mapping or disable translation.
+		 */
+		if (!strcmp(cb->name, "icp")) {
+			rc = iommu_domain_set_attr(cb->domain,
+				DOMAIN_ATTR_NON_FATAL_FAULTS, &non_fatal);
+			if (rc) {
+				CAM_ERR(CAM_SMMU,
+					"Failed to set ICP fault policy: %d", rc);
+				goto end;
+			}
 		}
 
 		iommu_dma_enable_best_fit_algo(dev);
