@@ -466,9 +466,53 @@ static void halt_spmi_pmic_arbiter(void)
 
 static void msm_restart_prepare(const char *cmd)
 {
+	/* Preserve panic logs in recovery without overriding normal reboots. */
+	if (in_panic)
+		cmd = "recovery";
+	else if (!cmd)
+		cmd = "";
+
 	qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
-	qpnp_pon_set_restart_reason(PON_RESTART_REASON_RECOVERY);
-	__raw_writel(0x77665502, restart_reason);
+
+	if (cmd != NULL) {
+		if (!strncmp(cmd, "bootloader", 10)) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_BOOTLOADER);
+			__raw_writel(0x77665500, restart_reason);
+		} else if (!strncmp(cmd, "recovery", 8)) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_RECOVERY);
+			__raw_writel(0x77665502, restart_reason);
+		} else if (!strcmp(cmd, "rtc")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_RTC);
+			__raw_writel(0x77665503, restart_reason);
+		} else if (!strcmp(cmd, "dm-verity device corrupted")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_DMVERITY_CORRUPTED);
+			__raw_writel(0x77665508, restart_reason);
+		} else if (!strcmp(cmd, "dm-verity enforcing")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_DMVERITY_ENFORCE);
+			__raw_writel(0x77665509, restart_reason);
+		} else if (!strcmp(cmd, "keys clear")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_KEYS_CLEAR);
+			__raw_writel(0x7766550a, restart_reason);
+		} else if (!strncmp(cmd, "oem-", 4)) {
+			unsigned long code;
+			int ret;
+
+			ret = kstrtoul(cmd + 4, 16, &code);
+			if (!ret)
+				__raw_writel(0x6f656d00 | (code & 0xff),
+					     restart_reason);
+		} else if (!strncmp(cmd, "edl", 3)) {
+			enable_emergency_dload_mode();
+		} else {
+			__raw_writel(0x77665501, restart_reason);
+		}
+	}
 
 	flush_cache_all();
 
